@@ -4,13 +4,20 @@
 
 # Runs `vericto check` with the action's inputs and mirrors its verdict.
 #
+# Online (a credential is configured) it checks against the workspace's rules.
+# Offline (`offline: true`, or `offline: auto` with no credential at all) it
+# runs `vericto check --offline`: the CLI's embedded engine and its standard
+# rules, no account, no request. A configured credential is never replaced by
+# offline mode, so an API or auth failure stays a failure (exit 3 or 4).
+#
 # Every input arrives as an environment variable (VA_*), never interpolated
 # into this script, and reaches the CLI as a single quoted argument or an env
 # var. The API key is passed to the CLI only through VERICTO_API_KEY, never on
 # the command line, and is masked in the log first.
 #
-# Out (step outputs): exit-code, result, sarif-file, report-file, blocked,
-# flagged, monitored, parse-errors, checkout-path. Exits with the CLI's code.
+# Out (step outputs): exit-code, result, mode, sarif-file, report-file,
+# blocked, flagged, monitored, parse-errors, checkout-path. Exits with the
+# CLI's code.
 set -euo pipefail
 
 here=$(dirname "$0")
@@ -27,6 +34,9 @@ cli_version=""
 code=""
 result=""
 blocked="" flagged="" monitored="" parse_errors=""
+# online or offline once decided; auto_offline: offline because no credential
+# was configured (offline: auto); cli_ran: the CLI was started.
+run_mode="" auto_offline=false cli_ran=false engine_version=""
 
 exit_meaning() {
   case "$1" in
@@ -53,6 +63,15 @@ write_summary() {
   if [ -n "$blocked" ]; then
     counts="| Blocked / flagged / monitored / parse errors | $blocked / $flagged / $monitored / $parse_errors |"
   fi
+  local mode_row=""
+  case "$run_mode" in
+    online) mode_row="online, your workspace's rules" ;;
+    offline)
+      mode_row="offline, the standard rules"
+      [ -n "$engine_version" ] && mode_row="$mode_row (engine \`$engine_version\`)"
+      [ "$auto_offline" = true ] && mode_row="$mode_row; no credential configured"
+      ;;
+  esac
   {
     echo "### Vericto SQL Check: $label"
     echo
@@ -60,10 +79,15 @@ write_summary() {
     echo "|---|---|"
     echo "| Result | \`$result\` |"
     echo "| Exit code | \`$code\` ($(exit_meaning "$code")) |"
+    [ -n "$mode_row" ] && echo "| Mode | $mode_row |"
     [ -n "$counts" ] && echo "$counts"
     [ -n "$selection" ] && echo "| SQL checked | $selection |"
     [ -n "$cli_version" ] && echo "| CLI | \`$cli_version\` |"
     echo
+    if [ "$run_mode" = offline ] && [ "$cli_ran" = true ]; then
+      echo "Checked offline with Vericto's standard rules: no account, and no SQL left the runner. A Vericto account adds your custom rules, business policies, sensitive columns, and check history and audit in the dashboard. [Start free](https://vericto.com)"
+      echo
+    fi
   } >>"$GITHUB_STEP_SUMMARY"
 }
 
@@ -76,8 +100,30 @@ fail() {
   gh_error "$*"
   set_output exit-code "$code"
   set_output result "$result"
+  [ -n "$run_mode" ] && set_output mode "$run_mode"
   write_summary
   exit "$code"
+}
+
+# cli_at_least MAJOR MINOR: true when the installed CLI ($cli_version, e.g.
+# "vericto 1.12.0") is MAJOR.MINOR or later. An unreadable version is not
+# refused here: the CLI decides.
+cli_at_least() {
+  local v=${cli_version##* } major minor
+  matches '^[0-9]+\.[0-9]+\.[0-9]+' "$v" || return 0
+  major=${v%%.*} minor=${v#*.}
+  minor=${minor%%.*}
+  [ "$major" -gt "$1" ] || { [ "$major" -eq "$1" ] && [ "$minor" -ge "$2" ]; }
+}
+
+# offline_needs: why the installed CLI cannot check offline on this runner,
+# or nothing when it can.
+offline_needs() {
+  if ! cli_at_least 1 9; then
+    echo "offline mode needs cli-version 1.9.0 or later (installed: $cli_version)"
+  elif is_windows && ! cli_at_least 1 11; then
+    echo "offline mode on Windows runners needs cli-version 1.11.0 or later (installed: $cli_version)"
+  fi
 }
 
 bool_input() { # NAME VALUE VAR: stores true/false in VAR
@@ -109,6 +155,12 @@ case "${VA_UPLOAD_SARIF:-true}" in
   *) fail 2 "input 'upload-sarif' must be true or false (got '$VA_UPLOAD_SARIF')" ;;
 esac
 if [ -n "${VA_CHANGED:-}" ]; then bool_input changed "$VA_CHANGED" changed; fi
+case "${VA_OFFLINE:-auto}" in
+  auto | Auto | AUTO) offline=auto ;;
+  true | True | TRUE) offline=true ;;
+  false | False | FALSE) offline=false ;;
+  *) fail 2 "input 'offline' must be auto, true or false (got '$VA_OFFLINE')" ;;
+esac
 
 dialect=${VA_DIALECT:-}
 if [ -n "$dialect" ] && ! matches '^[a-z][a-z0-9_]{0,31}$' "$dialect"; then
@@ -121,7 +173,6 @@ fi
 api_url=${VA_API_URL:-}
 if [ -n "$api_url" ]; then
   matches '^https?://[^[:space:]]+$' "$api_url" || fail 2 "input 'api-url' must be an http(s) URL"
-  case "$api_url" in http://*) gh_warning "api-url uses plain http: the API key and the SQL travel unencrypted." ;; esac
 fi
 workspace=${VA_WORKSPACE:-}
 if [ -n "$workspace" ] && ! matches '^[A-Za-z0-9_.:-]{1,128}$' "$workspace"; then
@@ -136,31 +187,69 @@ is_single_line "$baseline" || fail 2 "input 'baseline' must be a single path"
 # Optional: action.yml always sets it, a direct run may not (set -u).
 files=${VA_FILES:-}
 
-# ── Credentials ──────────────────────────────────────────────────────────────
+# ── Credentials and mode ─────────────────────────────────────────────────────
 args=(check "--format=$format")
-if [ "$oidc" = true ]; then
+cli_version=$("$VA_BIN" --version | tr -d '\r')
+no_creds="no credentials: set 'api-key: \${{ secrets.VERICTO_API_KEY }}', or 'oidc: true' with 'workspace'"
+if [ "$offline" = true ]; then
+  [ "$oidc" = true ] && fail 2 "set either oidc: true or offline: true, not both"
+  [ -n "${VA_API_KEY:-}" ] && fail 2 "set either api-key or offline: true, not both"
+  run_mode=offline
+  if [ -n "${VERICTO_API_KEY:-}" ]; then
+    gh_notice "VERICTO_API_KEY is set on the job; not used here: offline: true checks with the standard rules, without an account."
+  fi
+elif [ "$oidc" = true ]; then
   [ -n "${VA_API_KEY:-}" ] && fail 2 "set either api-key or oidc: true, not both"
   # A job-level static key must not win over the OIDC login asked for here.
   unset VERICTO_API_KEY
   if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
     fail 3 "oidc: true needs 'permissions: id-token: write' on the job (no OIDC token is available)"
   fi
+  run_mode=online
   args+=(--oidc)
   [ -n "$workspace" ] && export VERICTO_WORKSPACE_ID="$workspace"
 elif [ -n "${VA_API_KEY:-}" ]; then
+  run_mode=online
   export VERICTO_API_KEY="$VA_API_KEY"
-elif [ -z "${VERICTO_API_KEY:-}" ]; then
-  fail 3 "no credentials: set 'api-key: \${{ secrets.VERICTO_API_KEY }}', or 'oidc: true' with 'workspace'"
+elif [ -n "${VERICTO_API_KEY:-}" ]; then
+  run_mode=online
+elif [ "$offline" = false ]; then
+  fail 3 "$no_creds (offline: false requires one)"
+else
+  # offline: auto and no credential of any kind: check offline rather than
+  # fail. Only here: a credential that is configured but rejected, or an API
+  # that cannot be reached, keeps failing (exit 3 or 4).
+  why=$(offline_needs)
+  [ -z "$why" ] || fail 3 "$no_creds. Checking without an account (offline) is not possible here: $why."
+  run_mode=offline auto_offline=true
+  gh_warning "No Vericto credential is configured, so this run checks offline with the standard rules only. Set 'offline: true' to choose this explicitly, or pass 'api-key' or 'oidc: true' to check against your workspace's rules. If a secret was expected, it is missing (fork pull requests get no secrets)."
 fi
 unset VA_API_KEY
 
-# The action always checks online, against the workspace's own policy. Since
-# CLI 1.9.0, VERICTO_OFFLINE=1 switches `vericto check` to the embedded engine's
-# standard rules only (no custom rules, overrides or audit trail), and with
-# --oidc it is a usage error. A job-level VERICTO_OFFLINE, meant for another
-# step, must not quietly weaken this check: it is ignored here.
-if [ -n "${VERICTO_OFFLINE:-}" ]; then
-  gh_warning "VERICTO_OFFLINE is set on the job; ignored here: the action always checks online against your workspace's rules."
+if [ "$run_mode" = offline ]; then
+  why=$(offline_needs)
+  [ -z "$why" ] || fail 2 "$why"
+  # No credential reaches the CLI in offline mode, not even a job-level one.
+  unset VERICTO_API_KEY VERICTO_WORKSPACE_ID
+  args+=(--offline)
+  unused=""
+  [ -n "$api_url" ] && unused="$unused api-url"
+  [ -n "$timeout" ] && unused="$unused timeout"
+  [ -n "$workspace" ] && unused="$unused workspace"
+  if [ -n "$unused" ]; then
+    gh_notice "not used offline (no request is made):$unused"
+  fi
+  api_url="" timeout=""
+else
+  case "$api_url" in http://*) gh_warning "api-url uses plain http: the API key and the SQL travel unencrypted." ;; esac
+fi
+
+# The action's own input chooses the mode. Since CLI 1.9.0, VERICTO_OFFLINE=1
+# switches `vericto check` to the standard rules only, and with --oidc it is a
+# usage error. A job-level VERICTO_OFFLINE, meant for another step, must not
+# quietly weaken an online check: it is ignored here.
+if [ -n "${VERICTO_OFFLINE:-}" ] && [ "$run_mode" = online ]; then
+  gh_warning "VERICTO_OFFLINE is set on the job; ignored here: with a credential the action checks online against your workspace's rules. Use the action's 'offline: true' input to check offline."
 fi
 unset VERICTO_OFFLINE
 
@@ -336,10 +425,9 @@ if [ -n "$ext" ]; then
   args+=("--output=$(native_path "$report")")
 fi
 
-cli_version=$("$VA_BIN" --version | tr -d '\r')
-
 # ── Run ──────────────────────────────────────────────────────────────────────
 echo "Running: vericto ${args[*]}"
+cli_ran=true
 set +e
 if [ "$mode" = files ]; then
   "$VA_BIN" "${args[@]}" <"$list"
@@ -390,6 +478,15 @@ if [ -n "$report" ] && [ -f "$report" ]; then
         ;;
     esac
     counts=$(printf '%s' "$counts" | tr -d '\r')
+    if [ "$run_mode" = offline ]; then
+      # Offline reports name the embedded engine (SARIF run properties, JSON).
+      case "$format" in
+        sarif) engine_version=$(jq -r '.runs[0].properties.engine_version // empty' "$report" 2>/dev/null) || engine_version="" ;;
+        json) engine_version=$(jq -r '.engine_version // empty' "$report" 2>/dev/null) || engine_version="" ;;
+      esac
+      engine_version=$(printf '%s' "$engine_version" | tr -d '\r')
+      matches '^[0-9A-Za-z.+-]{1,32}$' "$engine_version" || engine_version=""
+    fi
     tab=$'\t'
     if matches "^[0-9]+${tab}[0-9]+${tab}[0-9]+${tab}[0-9]+\$" "$counts"; then
       IFS=$'\t' read -r blocked flagged monitored parse_errors <<<"$counts"
@@ -410,6 +507,7 @@ fi
 
 set_output exit-code "$code"
 set_output result "$result"
+set_output mode "$run_mode"
 set_output blocked "$blocked"
 set_output flagged "$flagged"
 set_output monitored "$monitored"
@@ -418,7 +516,13 @@ write_summary
 
 case "$code" in
   0) ;;
-  1) gh_error "Vericto found SQL at or above fail_on in this change. See the annotations above and in Code Scanning." ;;
+  1)
+    if [ "$run_mode" = offline ]; then
+      gh_error "Vericto's standard rules (offline) found SQL at or above fail_on in this change. See the annotations above and in Code Scanning."
+    else
+      gh_error "Vericto found SQL at or above fail_on in this change. See the annotations above and in Code Scanning."
+    fi
+    ;;
   2)
     msg="vericto check failed with a usage error (exit 2); see the log above."
     if [ "$mode" = changed ] && [ "$(git rev-parse --is-shallow-repository 2>/dev/null)" = true ]; then

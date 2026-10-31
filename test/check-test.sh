@@ -4,7 +4,8 @@
 
 # Offline tests for scripts/check.sh with a stand-in CLI
 # (test/fixtures/fake-cli/vericto): input validation, credentials, which SQL
-# is selected (files, directories, globs, changed files), report formats,
+# is selected (files, directories, globs, changed files), offline mode and
+# its automatic choice without a credential, report formats,
 # exit codes, outputs, annotations and the job summary.
 #
 # Usage: bash test/check-test.sh
@@ -65,6 +66,10 @@ check "$ws" VA_API_KEY="$KEY" VA_FILES=migrations VA_UPLOAD_SARIF=1
 expect_usage_error "upload-sarif not a boolean" "input 'upload-sarif' must be true or false (got '1')"
 check "$ws" VA_API_KEY="$KEY" VA_FILES=migrations VA_CHANGED=maybe
 expect_usage_error "changed not a boolean" "input 'changed' must be true or false (got 'maybe')"
+check "$ws" VA_FILES=migrations VA_OFFLINE=yes
+expect_usage_error "offline not auto/true/false" "input 'offline' must be auto, true or false (got 'yes')"
+check "$ws" VA_FILES=migrations VA_OFFLINE=$'true\n'
+expect_usage_error "multi-line offline" "input 'offline' must be auto, true or false"
 check "$ws" VA_API_KEY="$KEY" VA_FILES=migrations VA_DIALECT='postgres"; touch "pwned'
 expect_usage_error "hostile dialect" "input 'dialect' must be a dialect name"
 check "$ws" VA_API_KEY="$KEY" VA_FILES=migrations VA_DIALECT=Postgres
@@ -142,11 +147,17 @@ case "$(logged args)" in
 esac
 
 echo "# credentials"
-check "$ws" VA_FILES=migrations/0001_create_users.sql
-expect_rc 3 "no api-key, no VERICTO_API_KEY, no oidc"
-expect_out "no credentials: set 'api-key: \${{ secrets.VERICTO_API_KEY }}', or 'oidc: true' with 'workspace'" "explains the options"
+check "$ws" VA_OFFLINE=false VA_FILES=migrations/0001_create_users.sql
+expect_rc 3 "offline: false, no api-key, no VERICTO_API_KEY, no oidc"
+expect_out "no credentials: set 'api-key: \${{ secrets.VERICTO_API_KEY }}', or 'oidc: true' with 'workspace' (offline: false requires one)" "explains the options"
 expect_output exit-code 3 "exit-code 3"
 expect_output result fail "result fail"
+expect_output mode "" "no mode: the action stopped before choosing"
+expect_eq "$(logged args)" "<not run>" "offline: false without a credential: the CLI did not run"
+check "$ws" VA_OFFLINE=FALSE VA_API_KEY="$KEY" VA_FILES=migrations/0001_create_users.sql
+expect_rc 0 "offline: false with an api-key"
+case "$(logged args)" in *--offline*) not_ok "offline: false passes --offline" "$(logged args)" ;; *) ok "offline: false checks online" ;; esac
+expect_output mode online "mode online"
 check "$ws" VA_API_KEY="$KEY" VA_FILES=migrations/0001_create_users.sql
 expect_rc 0 "an api-key"
 expect_eq "$(printf '%s\n' "$out" | head -n 1)" "::add-mask::$KEY" "masks the key before anything else is printed"
@@ -175,11 +186,123 @@ expect_eq "$(logged workspace-id)" ws_123 "exports VERICTO_WORKSPACE_ID"
 check "$ws" VA_OIDC=true ACTIONS_ID_TOKEN_REQUEST_URL=https://token.example VA_FILES=migrations/0001_create_users.sql
 expect_eq "$(logged workspace-id)" "<unset>" "no workspace input: left to the CLI (.vericto.toml)"
 
-echo "# offline mode (CLI 1.9.0+) is never used"
+echo "# offline: auto (the default) without any credential"
+for v in "" auto AUTO; do
+  check "$ws" VA_OFFLINE="$v" VA_FILES=migrations/0001_create_users.sql
+  expect_rc 0 "offline '$v', no credential: checks instead of failing"
+  case "$(logged args)" in *--offline*) ok "offline '$v', no credential: passes --offline" ;; *) not_ok "auto: --offline" "$(logged args)" ;; esac
+  expect_output mode offline "offline '$v', no credential: mode offline"
+done
+expect_out "::warning title=Vericto SQL Check::No Vericto credential is configured, so this run checks offline with the standard rules only. Set 'offline: true' to choose this explicitly" "auto offline is a warning annotation"
+expect_out "If a secret was expected, it is missing (fork pull requests get no secrets)." "the warning names the missing-secret case"
+expect_eq "$(logged api-key)" "<unset>" "auto offline: no key reaches the CLI"
+case "$(summary)" in
+  *"### Vericto SQL Check: PASS"*"| Mode | offline, the standard rules (engine \`4.3.0\`); no credential configured |"*"| Blocked / flagged / monitored / parse errors | 0 / 0 / 0 / 0 |"*"Checked offline with Vericto's standard rules: no account, and no SQL left the runner. A Vericto account adds your custom rules, business policies, sensitive columns, and check history and audit in the dashboard. [Start free](https://vericto.com)"*)
+    ok "auto offline: the summary names the mode, the engine and what an account adds" ;;
+  *) not_ok "auto offline summary" "$(summary)" ;;
+esac
+expect_eq "$(summary | grep -c 'Start free')" 1 "the account line appears once"
+check "$ws" VA_FILES='migrations/*.sql'
+expect_rc 1 "auto offline: a BLOCKED finding still fails the run"
+expect_output result fail "auto offline: result fail"
+expect_output blocked 1 "auto offline: blocked 1"
+if [ -s "$(output_of sarif-file)" ]; then ok "auto offline: the SARIF is uploaded"; else not_ok "auto offline sarif-file" "$outputs"; fi
+expect_out "::error title=Vericto SQL Check::Vericto's standard rules (offline) found SQL at or above fail_on in this change." "auto offline: the error says offline"
+check "$ws" VA_FILES='migrations/*.sql' VA_FORMAT=json FAKE_DECISION=FLAGGED
+expect_rc 0 "auto offline, json"
+expect_output flagged 1 "auto offline, json: counts"
+case "$(summary)" in *"(engine \`4.3.0\`)"*) ok "auto offline, json: engine from the JSON report" ;; *) not_ok "json engine" "$(summary)" ;; esac
+check "$ws" VA_FILES=migrations/0001_create_users.sql VA_FORMAT=text
+case "$(summary)" in
+  *"| Mode | offline, the standard rules; no credential configured |"*) ok "auto offline, text: mode without an engine version" ;;
+  *) not_ok "text mode row" "$(summary)" ;;
+esac
+check "$ws" VA_FILES=migrations/0001_create_users.sql FAKE_ENGINE='4.3.0`|x'
+case "$(summary)" in *'4.3.0`|x'*) not_ok "an odd engine version reaches the summary" "$(summary)" ;; *) ok "an engine version that is not a version is left out" ;; esac
+check "$ws" VA_FILES=migrations/0001_create_users.sql VA_API_URL=http://127.0.0.1:9 VA_TIMEOUT=5 VA_WORKSPACE=ws_1
+expect_rc 0 "auto offline with api-url, timeout and workspace"
+expect_out "::notice title=Vericto SQL Check::not used offline (no request is made): api-url timeout workspace" "says they are not used"
+expect_no_out "plain http" "no plain-http warning offline"
+case "$(logged args)" in *--api-url* | *--timeout*) not_ok "offline passes request options" "$(logged args)" ;; *) ok "no --api-url or --timeout offline" ;; esac
+expect_eq "$(logged workspace-id)" "<unset>" "no VERICTO_WORKSPACE_ID offline"
+check "$ws" VA_FILES=migrations/0001_create_users.sql VA_DIALECT=mysql VA_BASELINE=b.json
+expect_eq "$(logged args | sed -n '1,4p')" "--format=sarif
+--offline
+--dialect=mysql
+--baseline=b.json" "offline keeps dialect and baseline"
+# Offline needs CLI 1.9.0 (1.11.0 on Windows); without it, auto fails as before.
+check "$ws" VA_FILES=migrations/0001_create_users.sql FAKE_VERSION=1.8.2
+expect_rc 3 "auto, no credential, CLI 1.8.2: exit 3 as before"
+expect_out "no credentials: set 'api-key: \${{ secrets.VERICTO_API_KEY }}', or 'oidc: true' with 'workspace'. Checking without an account (offline) is not possible here: offline mode needs cli-version 1.9.0 or later (installed: vericto 1.8.2)." "says why it could not check offline"
+expect_eq "$(logged args)" "<not run>" "CLI 1.8.2: the CLI did not run"
+check "$ws" VA_FILES=migrations/0001_create_users.sql FAKE_VERSION=1.10.1 RUNNER_OS=Windows
+expect_rc 3 "auto, no credential, Windows, CLI 1.10.1: exit 3"
+expect_out "offline mode on Windows runners needs cli-version 1.11.0 or later (installed: vericto 1.10.1)" "names the Windows minimum"
+check "$ws" VA_FILES=migrations/0001_create_users.sql FAKE_VERSION=1.10.1
+expect_rc 0 "CLI 1.10.1 off Windows: offline works"
+check "$ws" VA_FILES=migrations/0001_create_users.sql FAKE_VERSION=1.9.0-rc.1
+expect_rc 0 "a pre-release 1.9.0: offline works"
+check "$ws" VA_FILES=migrations/0001_create_users.sql FAKE_VERSION=2.0.0 RUNNER_OS=Windows
+expect_rc 0 "CLI 2.0.0 on Windows: offline works"
+check "$ws" VA_FILES=migrations/0001_create_users.sql FAKE_VERSION=dev
+expect_rc 0 "an unreadable CLI version is left to the CLI"
+
+echo "# offline: true"
+check "$ws" VA_OFFLINE=true VA_FILES=migrations/0001_create_users.sql
+expect_rc 0 "offline: true"
+case "$(logged args)" in *--offline*) ok "passes --offline" ;; *) not_ok "offline: true --offline" "$(logged args)" ;; esac
+expect_output mode offline "mode offline"
+expect_no_out "No Vericto credential is configured" "chosen explicitly: no warning"
+case "$(summary)" in
+  *"| Mode | offline, the standard rules (engine \`4.3.0\`) |"*"[Start free](https://vericto.com)"*) ok "offline: true summary" ;;
+  *) not_ok "offline: true summary" "$(summary)" ;;
+esac
+check "$ws" VA_OFFLINE=True VERICTO_API_KEY=vtro_job_level VA_FILES=migrations/0001_create_users.sql
+expect_rc 0 "offline: true with a job-level VERICTO_API_KEY"
+expect_out "::add-mask::vtro_job_level" "the job-level key is still masked"
+expect_out "::notice title=Vericto SQL Check::VERICTO_API_KEY is set on the job; not used here" "says it is not used"
+expect_eq "$(logged api-key)" "<unset>" "the job-level key does not reach the CLI"
+check "$ws" VA_OFFLINE=true VA_API_KEY="$KEY" VA_FILES=migrations
+expect_usage_error "api-key and offline: true" "set either api-key or offline: true, not both"
+check "$ws" VA_OFFLINE=true VA_OIDC=true ACTIONS_ID_TOKEN_REQUEST_URL=https://token.example VA_FILES=migrations
+expect_usage_error "oidc and offline: true" "set either oidc: true or offline: true, not both"
+check "$ws" VA_OFFLINE=true VA_FILES=migrations/0001_create_users.sql FAKE_VERSION=1.8.2
+expect_usage_error "offline: true with CLI 1.8.2" "offline mode needs cli-version 1.9.0 or later (installed: vericto 1.8.2)"
+check "$ws" VA_OFFLINE=TRUE VA_FILES=migrations/0001_create_users.sql FAKE_VERSION=1.9.1 RUNNER_OS=Windows
+expect_usage_error "offline: true on Windows with CLI 1.9.1" "offline mode on Windows runners needs cli-version 1.11.0 or later"
+check "$ws" VA_OFFLINE=true VA_FILES='nothing/*.sql'
+expect_usage_error "offline: no SQL files found" "no SQL files match 'nothing/*.sql'"
+expect_output mode offline "a usage error after choosing offline still reports the mode"
+case "$(summary)" in *"Start free"*) not_ok "the account line on a usage error" "$(summary)" ;; *) ok "no account line when the CLI did not run" ;; esac
+check "$ws" VA_OFFLINE=true VA_FILES=migrations FAKE_EXIT=2
+expect_rc 2 "offline: a CLI usage error is the step's"
+expect_out "vericto check failed with a usage error (exit 2)" "offline: exit 2 annotation"
+expect_output result fail "offline exit 2: result fail"
+
+echo "# a configured credential never falls back to offline"
+check "$ws" VA_API_KEY="$KEY" VA_FILES=migrations FAKE_EXIT=4
+expect_rc 4 "api-key, API unreachable: exit 4"
+case "$(logged args)" in *--offline*) not_ok "an API failure switched to offline" "$(logged args)" ;; *) ok "api-key, exit 4: stayed online" ;; esac
+expect_output mode online "api-key, exit 4: mode online"
+case "$(summary)" in *"Start free"*) not_ok "account line online" "$(summary)" ;; *"| Mode | online, your workspace's rules |"*) ok "online summary: mode online, no account line" ;; *) not_ok "online summary mode" "$(summary)" ;; esac
+check "$ws" VA_API_KEY="$KEY" VA_FILES=migrations FAKE_EXIT=3
+expect_rc 3 "api-key rejected: exit 3"
+case "$(logged args)" in *--offline*) not_ok "a rejected key switched to offline" ;; *) ok "api-key, exit 3: stayed online" ;; esac
+check "$ws" VERICTO_API_KEY=vtro_job_level VA_FILES=migrations FAKE_EXIT=4
+expect_rc 4 "job-level key, API unreachable: exit 4"
+case "$(logged args)" in *--offline*) not_ok "job-level key switched to offline" ;; *) ok "job-level key, exit 4: stayed online" ;; esac
+check "$ws" VA_OIDC=true VA_WORKSPACE=ws_1 VA_FILES=migrations
+expect_rc 3 "oidc without a token: exit 3, never offline"
+expect_eq "$(logged args)" "<not run>" "oidc without a token: the CLI did not run"
+check "$ws" VA_OIDC=true VA_WORKSPACE=ws_1 ACTIONS_ID_TOKEN_REQUEST_URL=https://token.example VA_FILES=migrations FAKE_EXIT=3
+expect_rc 3 "oidc rejected: exit 3"
+case "$(logged args)" in *--offline*) not_ok "oidc rejected switched to offline" ;; *) ok "oidc, exit 3: stayed online" ;; esac
+
+echo "# a job-level VERICTO_OFFLINE never chooses the mode"
 check "$ws" VA_API_KEY="$KEY" VERICTO_OFFLINE=1 VA_FILES=migrations/0001_create_users.sql
 expect_rc 0 "a job-level VERICTO_OFFLINE=1 with an api-key"
 expect_eq "$(logged offline)" "<unset>" "VERICTO_OFFLINE does not reach the CLI"
-expect_out "::warning title=Vericto SQL Check::VERICTO_OFFLINE is set on the job; ignored here: the action always checks online against your workspace's rules." "with a warning"
+expect_out "::warning title=Vericto SQL Check::VERICTO_OFFLINE is set on the job; ignored here: with a credential the action checks online against your workspace's rules. Use the action's 'offline: true' input to check offline." "with a warning"
 case "$(logged args)" in *--offline*) not_ok "passes --offline" "$(logged args)" ;; *) ok "never passes --offline" ;; esac
 check "$ws" VA_OIDC=true VA_WORKSPACE=ws_123 VERICTO_OFFLINE=true ACTIONS_ID_TOKEN_REQUEST_URL=https://token.example \
   VA_FILES=migrations/0001_create_users.sql
@@ -190,6 +313,13 @@ expect_eq "$(logged offline)" "<unset>" "an empty VERICTO_OFFLINE is unset too"
 expect_no_out "VERICTO_OFFLINE is set" "an empty VERICTO_OFFLINE: no warning"
 check "$ws" VA_API_KEY="$KEY" VA_FILES=migrations/0001_create_users.sql
 expect_no_out "VERICTO_OFFLINE" "no VERICTO_OFFLINE: no warning"
+check "$ws" VA_OFFLINE=false VERICTO_OFFLINE=1 VA_FILES=migrations/0001_create_users.sql
+expect_rc 3 "offline: false, no credential, VERICTO_OFFLINE=1: still exit 3"
+check "$ws" VA_OFFLINE=true VERICTO_OFFLINE=0 VA_FILES=migrations/0001_create_users.sql
+expect_rc 0 "offline: true with VERICTO_OFFLINE=0 on the job"
+expect_eq "$(logged offline)" "<unset>" "offline: the job-level variable does not reach the CLI"
+case "$(logged args)" in *--offline*) ok "offline: true wins over VERICTO_OFFLINE=0" ;; *) not_ok "VERICTO_OFFLINE=0 vs offline: true" "$(logged args)" ;; esac
+expect_no_out "VERICTO_OFFLINE is set" "offline: no VERICTO_OFFLINE warning"
 
 echo "# CLI arguments"
 check "$ws" VA_API_KEY="$KEY" VA_FILES=migrations/0001_create_users.sql VA_DIALECT=mysql VA_BASELINE="base line.json" \
@@ -267,8 +397,8 @@ if [ -s "$sarif" ]; then ok "sarif-file points at the report"; else not_ok "sari
 expect_output report-file "$sarif" "report-file is the same report"
 expect_out "Running: vericto check --format=sarif --stdin-file-list --output=" "logs the command"
 case "$(summary)" in
-  *"### Vericto SQL Check: PASS"*"| Blocked / flagged / monitored / parse errors | 0 / 0 / 0 / 0 |"*"| SQL checked | 1 file(s) from \`files\` |"*"| CLI | \`vericto 1.12.0\` |"*)
-    ok "job summary: result, counts, selection and CLI version" ;;
+  *"### Vericto SQL Check: PASS"*"| Mode | online, your workspace's rules |"*"| Blocked / flagged / monitored / parse errors | 0 / 0 / 0 / 0 |"*"| SQL checked | 1 file(s) from \`files\` |"*"| CLI | \`vericto 1.12.0\` |"*)
+    ok "job summary: result, mode, counts, selection and CLI version" ;;
   *) not_ok "job summary" "$(summary)" ;;
 esac
 
@@ -396,6 +526,10 @@ check "$repo" VA_API_KEY="$KEY" VA_SINCE='main|x'
 case "$(summary)" in *'changed since `main_x`'*) ok "a ref is made inert in the Markdown summary" ;; *) not_ok "md_safe" "$(summary)" ;; esac
 check "$repo" VA_API_KEY="$KEY" VA_CHANGED=true
 expect_rc 0 "changed: true explicitly"
+check "$repo" VA_EVENT_NAME=push VA_EVENT_BEFORE="$base"
+expect_rc 0 "changed files offline (no credential)"
+expect_eq "$(logged args | grep -E '^--(offline|since)')" "--offline
+--since=$base" "offline: the same base, diffed locally"
 check "$repo/db" VA_API_KEY="$KEY"
 expect_usage_error "changed from a subdirectory" "changed must run from the root of the git checkout"
 check "$ws" VA_API_KEY="$KEY"

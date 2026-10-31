@@ -110,12 +110,14 @@ jobs:
         shell: bash
         run: bash test/pinned-version.sh >>"$GITHUB_OUTPUT"
 
-      # 1. Install + verify, then the action's own credential check (exit 3).
-      - name: "Action: no credentials"
+      # 1. Install + verify, then the action's own credential check (exit 3)
+      #    when offline: false asks for a credential.
+      - name: "Action: no credentials, offline: false"
         id: nocreds
         continue-on-error: true
         uses: ./
         with:
+          offline: false
           files: test/fixtures/migrations/*.sql
 
       - name: "Assert: installed the pinned CLI, failed with exit 3"
@@ -134,10 +136,62 @@ jobs:
           test "$EXIT_CODE" = 3
           test "$RESULT" = fail
 
+      # 1b. No credential at all (offline: auto, the default): the real CLI
+      #     checks offline with its standard rules, and the fixtures' DELETE
+      #     without WHERE blocks (exit 1). No key, no account, no request.
+      - name: "Action: no account (offline: auto)"
+        id: noaccount
+        continue-on-error: true
+        uses: ./
+        with:
+          files: test/fixtures/migrations/*.sql
+          upload-sarif: false
+
+      - name: "Assert: offline verdict, exit 1, SARIF written"
+        shell: bash
+        env:
+          OUTCOME: ${{ steps.noaccount.outcome }}
+          EXIT_CODE: ${{ steps.noaccount.outputs.exit-code }}
+          RESULT: ${{ steps.noaccount.outputs.result }}
+          MODE: ${{ steps.noaccount.outputs.mode }}
+          BLOCKED: ${{ steps.noaccount.outputs.blocked }}
+          SARIF: ${{ steps.noaccount.outputs.sarif-file }}
+        run: |
+          set -euo pipefail
+          test "$OUTCOME" = failure
+          test "$EXIT_CODE" = 1
+          test "$RESULT" = fail
+          test "$MODE" = offline
+          test "$BLOCKED" = 1
+          test -s "$SARIF"
+          grep -q '"mode": *"offline"' "$SARIF"
+
+      # 1c. offline: true on a safe migration: pass.
+      - name: "Action: offline: true"
+        id: offlinetrue
+        uses: ./
+        with:
+          offline: true
+          files: test/fixtures/migrations/0001_create_users.sql
+          upload-sarif: false
+
+      - name: "Assert: offline pass"
+        shell: bash
+        env:
+          EXIT_CODE: ${{ steps.offlinetrue.outputs.exit-code }}
+          RESULT: ${{ steps.offlinetrue.outputs.result }}
+          MODE: ${{ steps.offlinetrue.outputs.mode }}
+        run: |
+          set -euo pipefail
+          test "$EXIT_CODE" = 0
+          test "$RESULT" = pass
+          test "$MODE" = offline
+
       # 2. The CLI runs end to end (cached install, globs, key via env) against
       #    an address nothing listens on: no verdict, exit 4, no SARIF. A
-      #    job-level VERICTO_OFFLINE=1 is ignored: offline mode (CLI 1.9.0+)
-      #    would answer locally (exit 1 on the fixtures' DELETE) instead.
+      #    configured key never falls back to offline, and a job-level
+      #    VERICTO_OFFLINE=1 is ignored: offline mode would answer locally
+      #    (exit 1 on the fixtures' DELETE) instead.
       - name: "Action: API unreachable"
         id: offline
         continue-on-error: true
@@ -158,12 +212,14 @@ jobs:
           OUTCOME: ${{ steps.offline.outcome }}
           EXIT_CODE: ${{ steps.offline.outputs.exit-code }}
           RESULT: ${{ steps.offline.outputs.result }}
+          MODE: ${{ steps.offline.outputs.mode }}
           SARIF: ${{ steps.offline.outputs.sarif-file }}
         run: |
           set -euo pipefail
           test "$OUTCOME" = failure
           test "$EXIT_CODE" = 4
           test "$RESULT" = fail
+          test "$MODE" = online
           test -z "$SARIF"
 
       # 3. OIDC requested without `id-token: write`: a clear exit 3.

@@ -1,8 +1,9 @@
 # Vericto SQL Check
 
 A GitHub Action that checks the SQL in your pull requests (migrations, ad-hoc
-scripts, generated queries) against your [Vericto](https://vericto.com)
-workspace's rules before it runs anywhere. Findings appear as Code Scanning
+scripts, generated queries) before it runs anywhere: offline against
+[Vericto](https://vericto.com)'s standard rules, with no account, or online
+against your Vericto workspace's rules. Findings appear as Code Scanning
 annotations on the PR, and a blocked statement fails the job.
 
 The action wraps [`vericto check`](https://github.com/vericto/vericto-cli) from
@@ -12,17 +13,16 @@ extracting it, runs the check and uploads the SARIF report.
 - Works on Linux (x64, arm64), macOS (x64, arm64) and Windows (x64, arm64)
   runners.
 - Checks only the `*.sql` files a PR changes by default, or the files you list.
-- Authenticates with an API key or with GitHub OIDC (no stored secret).
+- Works without an account: offline, the CLI's built-in engine applies the
+  standard rules on the runner, and no SQL leaves it.
+- With an account, authenticates with an API key or with GitHub OIDC (no
+  stored secret) and applies your workspace's rules.
 - Exits with the CLI's code, so a block fails the build and an outage is not
   mistaken for a pass.
 
-## Quick start (API key)
+## Quick start (no account)
 
-1. Create an API key with the `ci_dryrun:execute` scope in the Vericto
-   dashboard ([API keys](https://vericto.com/docs/api-keys)).
-2. Add it to the repository as a secret named `VERICTO_API_KEY`
-   (Settings, Secrets and variables, Actions).
-3. Add `.github/workflows/vericto.yml`:
+Add `.github/workflows/vericto.yml`:
 
 ```yaml
 name: Vericto SQL check
@@ -46,11 +46,40 @@ jobs:
 
       - uses: vericto/check-sql@v1
         with:
+          offline: true
+```
+
+That is the whole setup: no sign-up, no API key, no secret. The action checks
+the `*.sql` files the PR changes with Vericto's standard rules (`dialect`
+defaults to postgres), on the runner, and the findings show up on the PR. An
+unbounded `DELETE` or `UPDATE` blocks; schema changes (DROP, ALTER, TRUNCATE)
+are flagged. See [Offline and online](#offline-and-online) for what an
+account adds.
+
+Leaving out `offline: true` works too: with no credential configured, the
+action checks offline on its own, with a warning that says so (see
+[Which mode a run uses](#which-mode-a-run-uses)).
+
+## Quick start (API key)
+
+Online, the action checks against your workspace's rules: your custom rules
+and overrides, business policies and sensitive columns, and every check is
+recorded in the dashboard.
+
+1. Create an API key with the `ci_dryrun:execute` scope in the Vericto
+   dashboard ([API keys](https://vericto.com/docs/api-keys)).
+2. Add it to the repository as a secret named `VERICTO_API_KEY`
+   (Settings, Secrets and variables, Actions).
+3. In the workflow above, pass the key instead of `offline: true`:
+
+```yaml
+      - uses: vericto/check-sql@v1
+        with:
           api-key: ${{ secrets.VERICTO_API_KEY }}
 ```
 
-That is the whole setup: the action checks the `*.sql` files the PR changes
-(`dialect` defaults to postgres) and the findings show up on the PR.
+To make a missing secret fail the job instead of checking offline, add
+`offline: false`.
 
 ## OIDC (no long-lived secret)
 
@@ -85,11 +114,57 @@ jobs:
 
 `workspace` can also come from `workspace_id` in `.vericto.toml`.
 
+## Offline and online
+
+| | Offline (`offline: true`, or no credential) | Online (`api-key` or `oidc`) |
+|---|---|---|
+| Account, key | none | a Vericto workspace; API key or OIDC |
+| Network | none: no SQL leaves the runner | the selected SQL goes to your workspace, sanitized if it says so |
+| Rules | the CLI's standard rules (42 in CLI 1.12.0), at their default severities | your workspace's rules: the standard rules with your overrides, plus custom rules |
+| Business policies, sensitive columns, masking | no | yes |
+| Granularity | one result per file, with its strongest finding, at line 1 | one result per statement, at its line |
+| Check history and audit trail in the dashboard | no record anywhere | every check recorded, with the commit, run and actor |
+| Baselines | inline `-- vericto:ignore[...]` works; a baseline recorded online (`vericto baseline` needs an account) does not match offline findings | yes |
+| Metered | no | counts against the plan's monthly CLI allowance |
+| Annotations, job summary, SARIF, outputs | yes | yes |
+
+Offline is a baseline gate ("is this SQL obviously dangerous?"), not your
+workspace's policy and not evidence that a check took place. Every offline
+result says so: the CLI titles its annotations `Vericto (offline)`, the SARIF
+and JSON reports carry `"mode": "offline"` and the engine version, the job
+summary has a `Mode` row, and the `mode` output is `offline`. Offline needs
+CLI 1.9.0 or later (1.11.0 on Windows runners); the default, 1.12.0, has it.
+The CLI's [offline mode](https://github.com/vericto/vericto-cli#offline-mode)
+has the details.
+
+### Which mode a run uses
+
+| Credential configured | `offline: auto` (default) | `offline: true` | `offline: false` |
+|---|---|---|---|
+| none | offline, with a warning annotation | offline | exit 3 |
+| `api-key` input | online | exit 2 (set one or the other) | online |
+| `VERICTO_API_KEY` on the job only | online | offline; the key is not used (notice) | online |
+| `oidc: true` | online | exit 2 (set one or the other) | online |
+
+- **A configured credential never falls back to offline.** A key that is
+  rejected is exit 3 and an API that cannot be reached is exit 4, as before,
+  so a CI gate never weakens silently.
+- **Only "no credential at all" checks offline on its own**, and it says so
+  with a warning annotation, the `Mode` row in the job summary and the `mode`
+  output. The action cannot tell an empty secret from a secret that was
+  never set: `api-key: ${{ secrets.VERICTO_API_KEY }}` with the secret
+  missing, or a pull request from a fork (forks get no secrets), checks
+  offline too. Set `offline: false` where that must fail the job instead.
+- `api-url`, `timeout` and `workspace` are not used offline (a notice says
+  so). A `VERICTO_OFFLINE` variable set on the job never chooses the mode:
+  with a credential it is ignored, with a warning.
+
 ## Inputs
 
 | Input | Default | Description |
 |---|---|---|
-| `api-key` | | Vericto API key (`vtro_...`), from a secret. Not used with `oidc: true`. Falls back to a `VERICTO_API_KEY` env var set on the job. |
+| `offline` | `auto` | `true`: check offline with the standard rules, no account. `false`: always online; no credential is exit 3. `auto`: online with a credential, offline (with a warning) without one. See [Which mode a run uses](#which-mode-a-run-uses). |
+| `api-key` | | Vericto API key (`vtro_...`), from a secret. Not used with `oidc: true` or `offline: true`. Falls back to a `VERICTO_API_KEY` env var set on the job. |
 | `oidc` | `false` | Authenticate with GitHub OIDC. Needs `id-token: write`. |
 | `workspace` | | Workspace ID for OIDC. Falls back to `VERICTO_WORKSPACE_ID`, then `.vericto.toml`. |
 | `files` | | Paths or globs (`*`, `?`, `[...]`, `**`), separated by spaces or newlines, relative to `working-directory`. A directory means every `*.sql` under it. Empty: check changed files. |
@@ -114,6 +189,7 @@ default is to fail only on BLOCKED findings. See the
 |---|---|
 | `exit-code` | The CLI's exit code (table below). |
 | `result` | `pass`, `warn` (passed, with findings that don't fail the run) or `fail`. |
+| `mode` | `online` (your workspace's rules) or `offline` (the standard rules); empty if the action failed before choosing. |
 | `sarif-file` | Path to the SARIF report; empty if none was written. |
 | `report-file` | Path to the report for any machine format; empty for `text`. |
 | `blocked`, `flagged`, `monitored`, `parse-errors` | Finding counts, for the `sarif` and `json` formats. |
@@ -123,8 +199,8 @@ default is to fail only on BLOCKED findings. See the
 | `0` | Nothing at or above `fail_on`. |
 | `1` | A finding at or above `fail_on`. |
 | `2` | Usage error: bad input, unreadable file, no base ref for `changed`. |
-| `3` | Authentication or plan error: missing or invalid key, OIDC not configured, plan not entitled, monthly allowance used up. |
-| `4` | Backend or network error, including a workspace config that can't be read. No verdict, and no SQL is sent in that case. |
+| `3` | Authentication or plan error: missing (with `offline: false`) or invalid key, OIDC not configured, plan not entitled, monthly allowance used up. Online only. |
+| `4` | Backend or network error, including a workspace config that can't be read. No verdict, and no SQL is sent in that case. Online only. |
 
 A non-zero code fails the step, and the job with it, unless you set
 `continue-on-error: true` and decide from `exit-code`.
@@ -136,7 +212,7 @@ A non-zero code fails the step, and the job with it, unless you set
 | `contents: read` | Check out the code. |
 | `security-events: write` | Upload SARIF to Code Scanning (`upload-sarif: true`). |
 | `actions: read` | Required by the SARIF upload in private repositories. |
-| `id-token: write` | OIDC only. |
+| `id-token: write` | OIDC only. Offline needs none of the Vericto ones. |
 
 Code Scanning is available on public repositories, and on private ones with
 GitHub Advanced Security (GitHub Code Security). Without it, set
@@ -195,7 +271,8 @@ git add .vericto-baseline.json
 
 Baselined findings are still reported (`result: warn`); they just don't fail
 the run. A single statement can also be suppressed inline with
-`-- vericto:ignore[VERICTO-001] reason`.
+`-- vericto:ignore[VERICTO-001] reason`. `vericto baseline` records online
+findings and needs an account; offline, use the inline suppression.
 
 ### A subdirectory in a monorepo
 
@@ -249,14 +326,23 @@ changed, the check passes and no SQL is sent.
   `since`.
 - **`changed must run from the root of the git checkout`:** git reports changed
   paths from the repository root. Run from the root, or list `files`.
-- **Exit 3:** the key is missing, invalid or lacks `ci_dryrun:execute`; the
-  OIDC trust policy doesn't match the repository; or the plan's monthly CLI
-  allowance is used up. `vericto doctor` shows which.
+- **`No Vericto credential is configured, so this run checks offline`
+  (warning):** no `api-key`, no `VERICTO_API_KEY` and no `oidc`, so the
+  action checked with the standard rules. Set `offline: true` if that is what
+  you want, or check the secret's name and that the event gets secrets (fork
+  pull requests don't). `offline: false` makes this case fail with exit 3.
+- **Exit 3:** the key is missing (with `offline: false`), invalid or lacks
+  `ci_dryrun:execute`; the OIDC trust policy doesn't match the repository; or
+  the plan's monthly CLI allowance is used up. `vericto doctor` shows which.
 - **`oidc: true needs 'permissions: id-token: write'`:** add the permission to
   the job. Pull requests from forks don't get OIDC tokens or secrets.
-- **`VERICTO_OFFLINE is set on the job; ignored here`:** the action always
-  checks online (see [Offline mode is not used](#offline-mode-is-not-used)).
-  Set `VERICTO_OFFLINE` only on the steps that run the CLI themselves.
+- **`VERICTO_OFFLINE is set on the job; ignored here`:** with a credential,
+  the action checks online; only its `offline` input chooses offline mode
+  (see [Which mode a run uses](#which-mode-a-run-uses)). Set
+  `VERICTO_OFFLINE` only on the steps that run the CLI themselves.
+- **`offline mode needs cli-version 1.9.0 or later`** (or 1.11.0 on Windows
+  runners): the pinned `cli-version` predates offline mode. Leave
+  `cli-version` at its default, or pin a newer one.
 - **`Windows ARM64 runners need cli-version 1.11.0 or later` (exit 2):** CLI
   releases before 1.11.0 have no Windows ARM64 build. Pin 1.11.0 or later, or
   leave `cli-version` at its default.
@@ -290,14 +376,17 @@ changed, the check passes and no SQL is sent.
   single argument.
 - **Pinned dependencies.** Every action this action uses is pinned by commit
   SHA. You can pin this action the same way:
-  `uses: vericto/check-sql@<full commit SHA> # v1.0.0`.
+  `uses: vericto/check-sql@<full commit SHA> # v1.3.0`.
 
 Report vulnerabilities as described in [SECURITY.md](SECURITY.md).
 
 ## SQL never leaves your CI unless it is selected for the check
 
-The action runs the CLI online: checking SQL means sending it to your
-Vericto workspace, which evaluates it with your rules. What is sent, per the
+Offline, nothing is sent: the CLI makes no request of any kind, to Vericto or
+anyone else, and evaluates on the runner.
+
+Online, checking SQL means sending it to your Vericto workspace, which
+evaluates it with your rules. What is sent, per the
 [CLI design](https://github.com/vericto/vericto-cli/blob/main/DESIGN.md):
 
 - **Only the files selected for the check** (the changed `*.sql` files, or
@@ -336,17 +425,6 @@ Nothing changes for a workspace in `raw` mode. If you pin `cli-version`, your
 pin still applies; with a `sanitized` workspace, pin `1.8.2` or later. Since
 action 1.2.0 the default is CLI 1.12.0.
 
-### Offline mode is not used
-
-Since CLI 1.9.0, `vericto check --offline` (or `VERICTO_OFFLINE=1`) checks SQL
-on the machine with the engine built into the CLI and its standard rules only:
-no custom rules, overrides, sensitive columns, allowlists or audit trail. The
-action never uses it. It always checks online against your workspace, needs a
-credential (a missing one is exit 3, never a silent switch to offline), and
-ignores a `VERICTO_OFFLINE` set on the job, with a warning, so a variable meant
-for another step cannot weaken the check. To check offline in a workflow, run
-the CLI in its own step.
-
 ## Links
 
 - [vericto.com](https://vericto.com)
@@ -358,7 +436,7 @@ the CLI in its own step.
 
 Releases follow [Semantic Versioning](https://semver.org). The major tag
 (`v1`) moves to each compatible release, the usual convention for GitHub
-Actions; `@v1.2.0` or a commit SHA stays fixed. Each action release pins a
+Actions; `@v1.3.0` or a commit SHA stays fixed. Each action release pins a
 CLI version, and a CLI bump ships as a new action release.
 
 ## Tests
@@ -408,7 +486,8 @@ espacio de trabajo de [Vericto](https://vericto.com) antes de que se ejecute.
 Los hallazgos aparecen como anotaciones de Code Scanning en el PR y una
 sentencia bloqueada hace fallar el job.
 
-Uso básico, con una clave de API guardada en el secreto `VERICTO_API_KEY`:
+Uso básico, sin cuenta ni clave de API (modo offline, con las reglas
+estándar):
 
 ```yaml
 permissions:
@@ -421,19 +500,30 @@ steps:
       fetch-depth: 0
   - uses: vericto/check-sql@v1
     with:
-      api-key: ${{ secrets.VERICTO_API_KEY }}
+      offline: true
 ```
+
+Con una cuenta de Vericto, guarde una clave de API en el secreto
+`VERICTO_API_KEY` y páselo en lugar de `offline: true`
+(`api-key: ${{ secrets.VERICTO_API_KEY }}`) para validar contra las reglas de
+su espacio de trabajo.
 
 - Por defecto se revisan solo los archivos `*.sql` que cambian en el PR. Para
   revisar archivos concretos, indíquelos en `files`.
+- En modo offline no se envía ningún SQL: el motor incluido en el CLI aplica
+  las reglas estándar en el runner. Una cuenta agrega sus reglas
+  personalizadas, políticas de negocio, columnas sensibles y el historial y la
+  auditoría en el panel. Sin ninguna credencial configurada, la acción valida
+  offline con una advertencia; con `offline: false`, falla con código 3. Una
+  credencial configurada nunca pasa a offline si la API falla.
 - Para no guardar una clave, use OIDC: `oidc: true`, `workspace: ws_...` y el
   permiso `id-token: write`.
 - La acción descarga una versión fija del CLI (1.12.0 por defecto) y
   verifica su SHA-256 antes de extraerlo. La clave de API se pasa solo por variable de entorno y nunca
   aparece en la línea de comandos.
-- El SQL seleccionado se envía a su espacio de trabajo para evaluarlo. Si el
-  espacio está en modo `sanitized`, los valores literales se reemplazan en el
-  runner antes del envío.
+- En modo online, el SQL seleccionado se envía a su espacio de trabajo para
+  evaluarlo. Si el espacio está en modo `sanitized`, los valores literales se
+  reemplazan en el runner antes del envío.
 
 Licencia: código abierto bajo la [Apache License 2.0](LICENSE) desde 1.1.0. Las
 versiones 1.0.3 y anteriores se publicaron bajo la Elastic License 2.0 y siguen

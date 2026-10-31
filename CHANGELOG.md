@@ -7,6 +7,53 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-10-30
+
+**Check SQL without an account.** A new `offline` input runs
+`vericto check --offline`: the engine built into the CLI applies Vericto's
+standard rules on the runner, with no API key, no account and no request.
+`uses: vericto/check-sql@v1` moves to 1.3.0. Workflows with a credential are
+unchanged: they check online, as before.
+
+### Added
+- **`offline` input** (`auto`, `true` or `false`; default `auto`).
+  - `true`: always offline. Combined with `api-key` or `oidc: true` it is a
+    usage error (exit 2); a job-level `VERICTO_API_KEY` is not used (a notice
+    says so). `api-url`, `timeout` and `workspace` are not used offline.
+  - `auto`: online when `api-key`, a job-level `VERICTO_API_KEY` or
+    `oidc: true` is set; **offline when none is**, with a warning annotation
+    (in 1.2.0 that was exit 3). See "Changed" below.
+  - `false`: always online; no credential is exit 3, as in 1.2.0.
+  - Offline needs CLI 1.9.0 or later (1.11.0 on Windows runners). With an
+    older pinned `cli-version`, `offline: true` is exit 2 and `auto` without
+    a credential stays exit 3, each saying why.
+- **`mode` output**: `online` or `offline`.
+- **Offline in the job summary**: a `Mode` row (with the engine version read
+  from the SARIF or JSON report) and one line on what an account adds
+  (custom rules, business policies, sensitive columns, check history and
+  audit in the dashboard). Annotations, the SARIF upload, the finding counts
+  and the other outputs work offline as online.
+- Self-tests on every runner with the real CLI: no account (`auto`, exit 1 on
+  the fixtures' DELETE, `mode: offline`) and `offline: true` (exit 0).
+
+### Changed
+- **No credential at all now checks offline instead of failing with exit
+  3**, unless `offline: false` is set. The action cannot tell an empty secret
+  from a missing one, so `api-key: ${{ secrets.VERICTO_API_KEY }}` with the
+  secret unset, or a pull request from a fork, now gets an offline check (and
+  a warning) instead of a failure. Set `offline: false` where a missing
+  credential must fail the job, as in 1.2.0.
+- **A configured credential never falls back to offline.** A rejected key or
+  OIDC login is still exit 3, and an unreachable API still exit 4, so a gate
+  never weakens silently.
+- A job-level `VERICTO_OFFLINE` still never chooses the mode: with a
+  credential it is ignored, with a warning that points to `offline: true`.
+- The plain-http `api-url` warning is only shown when the check runs online.
+- The action's description (Marketplace) says no account is needed.
+- README: a no-account quick start first, then the API key and OIDC; an
+  "Offline and online" comparison and a mode table replace "Offline mode is
+  not used".
+
 ## [1.2.0] - 2026-10-25
 
 **The default CLI moves to 1.12.0, and Windows ARM64 runners are supported.**
@@ -159,7 +206,10 @@ the inputs, outputs and the default `cli-version` (1.8.2) are those of 1.0.3.
 - SARIF upload to Code Scanning, with paths made relative to the repository
   root, and a job summary.
 
-[Unreleased]: https://github.com/vericto/check-sql/compare/v1.0.3...HEAD
+[Unreleased]: https://github.com/vericto/check-sql/compare/v1.3.0...HEAD
+[1.3.0]: https://github.com/vericto/check-sql/compare/v1.2.0...v1.3.0
+[1.2.0]: https://github.com/vericto/check-sql/compare/v1.1.0...v1.2.0
+[1.1.0]: https://github.com/vericto/check-sql/compare/v1.0.3...v1.1.0
 [1.0.3]: https://github.com/vericto/check-sql/compare/v1.0.2...v1.0.3
 [1.0.2]: https://github.com/vericto/check-sql/compare/v1.0.1...v1.0.2
 [1.0.1]: https://github.com/vericto/check-sql/compare/v1.0.0...v1.0.1
