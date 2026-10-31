@@ -11,7 +11,10 @@
 #                       under $FAKE_LOG_DIR,
 #                       then reports a finding for every line that starts with
 #                       "DELETE FROM" and has no WHERE, with the decision
-#                       $FAKE_DECISION (default BLOCKED).
+#                       $FAKE_DECISION (default BLOCKED). With --offline the
+#                       SARIF and JSON reports say "mode": "offline" and name
+#                       the engine ($FAKE_ENGINE, default 4.3.0), as the real
+#                       CLI does; --offline with --oidc is exit 2, as there.
 #
 # The report goes to --output in --format. Exit code: $FAKE_EXIT when set
 # (no report is written for a non-zero FAKE_EXIT), else 1 when a BLOCKED finding
@@ -35,14 +38,29 @@ printf '%s' "${VERICTO_API_KEY-<unset>}" >"$log/api-key"
 printf '%s' "${VERICTO_WORKSPACE_ID-<unset>}" >"$log/workspace-id"
 printf '%s' "${VERICTO_OFFLINE-<unset>}" >"$log/offline"
 
-format=sarif output="" list=false
+format=sarif output="" list=false offline=false oidc=false
 for a in "$@"; do
   case "$a" in
     --format=*) format=${a#--format=} ;;
     --output=*) output=${a#--output=} ;;
     --stdin-file-list) list=true ;;
+    --offline) offline=true ;;
+    --oidc) oidc=true ;;
   esac
 done
+if [ "$offline" = true ] && [ "$oidc" = true ]; then
+  echo "error: --oidc needs online mode" >&2
+  exit 2
+fi
+engine=${FAKE_ENGINE:-4.3.0}
+if [ "$offline" = true ]; then
+  echo "note: offline mode: standard rules at default severities, engine $engine." >&2
+  sarif_props=",\"properties\":{\"mode\":\"offline\",\"engine_version\":\"$engine\",\"ruleset_version\":\"standard@engine-$engine\"}"
+  json_mode="\"mode\":\"offline\",\"engine_version\":\"$engine\""
+else
+  sarif_props=",\"properties\":{\"mode\":\"online\"}"
+  json_mode="\"mode\":\"online\",\"engine_version\":null"
+fi
 
 : >"$log/files"
 if [ "$list" = true ]; then cat >"$log/files"; fi
@@ -73,8 +91,8 @@ if [ -n "$output" ] && [ "${FAKE_NO_REPORT:-}" != 1 ]; then
     cp "$FAKE_REPORT" "$output"
   else
     case "$format" in
-      sarif) printf '{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"vericto"}},"results":[%s]}]}\n' "$results" >"$output" ;;
-      json) printf '{"summary":{"blocked":%d,"flagged":%d,"monitored":0,"parse_errors":0}}\n' "$blocked" "$flagged" >"$output" ;;
+      sarif) printf '{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"vericto"}}%s,"results":[%s]}]}\n' "$sarif_props" "$results" >"$output" ;;
+      json) printf '{"summary":{"blocked":%d,"flagged":%d,"monitored":0,"parse_errors":0},%s}\n' "$blocked" "$flagged" "$json_mode" >"$output" ;;
       *) printf '[]\n' >"$output" ;;
     esac
   fi

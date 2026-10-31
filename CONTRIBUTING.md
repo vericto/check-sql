@@ -78,9 +78,11 @@ API.
 
 CI also runs the action itself (`uses: ./`) on `ubuntu-latest`,
 `ubuntu-24.04-arm`, `macos-latest`, `windows-latest` and `windows-11-arm`:
-without credentials, against an unreachable API (with `VERICTO_OFFLINE=1` on
-the step, which the action must ignore), with OIDC but no `id-token`
-permission, and with hostile inputs. The live check against the Vericto API runs only where the
+without credentials and `offline: false` (exit 3), without credentials and
+`offline` left at `auto` (an offline verdict from the real CLI), with
+`offline: true`, against an unreachable API with a key (exit 4, never an
+offline fallback; with `VERICTO_OFFLINE=1` on the step, which the action must
+ignore), with OIDC but no `id-token` permission, and with hostile inputs. The live check against the Vericto API runs only where the
 `VERICTO_API_KEY` secret is available, so not on pull requests from forks.
 
 ### Rules for the scripts

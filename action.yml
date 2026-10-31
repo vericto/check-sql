@@ -1,7 +1,7 @@
 name: Vericto SQL Check
 description: >-
-  Block destructive SQL in CI. Checks migrations against your Vericto rules 
-  and annotates the pull request.
+  Block destructive SQL in CI. Checks migrations against Vericto's rules and
+  annotates the pull request. No account needed.
 author: Vericto
 
 branding:
@@ -12,8 +12,8 @@ inputs:
   api-key:
     description: >-
       Vericto API key (vtro_...). Pass it from a secret. Not needed when
-      `oidc` is true. Falls back to a VERICTO_API_KEY environment variable
-      set on the job.
+      `oidc` or `offline` is true. Falls back to a VERICTO_API_KEY
+      environment variable set on the job.
     required: false
     default: ""
   oidc:
@@ -23,6 +23,17 @@ inputs:
       workspace in Vericto.
     required: false
     default: "false"
+  offline:
+    description: >-
+      Check offline with the standard rules built into the CLI: no account,
+      no API key, and no SQL leaves the runner. `auto` (the default) checks
+      online when `api-key`, a job-level VERICTO_API_KEY or `oidc` is set, and
+      offline, with a warning, when none is. `true` always checks offline.
+      `false` always checks online and fails with exit 3 without a credential.
+      A configured credential that is rejected, or an API that cannot be
+      reached, is never replaced by an offline check.
+    required: false
+    default: auto
   workspace:
     description: >-
       Vericto workspace ID for OIDC (ws_...). Falls back to VERICTO_WORKSPACE_ID
@@ -102,6 +113,9 @@ outputs:
   result:
     description: "pass, warn (passed with findings that do not fail the run) or fail."
     value: ${{ steps.check.outputs.result }}
+  mode:
+    description: "online (your workspace's rules) or offline (the standard rules). Empty when the action failed before choosing."
+    value: ${{ steps.check.outputs.mode }}
   sarif-file:
     description: "Path to the SARIF report. Empty when no report was written (format not sarif, nothing to check, or an error)."
     value: ${{ steps.check.outputs.sarif-file }}
@@ -155,6 +169,7 @@ runs:
         VA_BIN: ${{ steps.install.outputs.bin }}
         VA_API_KEY: ${{ inputs.api-key }}
         VA_OIDC: ${{ inputs.oidc }}
+        VA_OFFLINE: ${{ inputs.offline }}
         VA_WORKSPACE: ${{ inputs.workspace }}
         VA_FILES: ${{ inputs.files }}
         VA_CHANGED: ${{ inputs.changed }}
