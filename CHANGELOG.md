@@ -7,6 +7,11 @@ and this project adheres to
 
 ## [Unreleased]
 
+### Changed
+
+- Marketplace branding colour `blue` → `gray-dark`, to match the new Vericto
+  ink identity. No behaviour change.
+
 ## [1.4.0] - 2026-11-10
 
 **The default CLI moves to 2.0.0, which is open source under the AGPL.**
