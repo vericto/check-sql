@@ -7,6 +7,8 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [1.4.1] - 2026-11-16
+
 ### Changed
 
 - Marketplace branding colour `blue` → `gray-dark`, to match the new Vericto
@@ -288,7 +290,8 @@ the inputs, outputs and the default `cli-version` (1.8.2) are those of 1.0.3.
 - SARIF upload to Code Scanning, with paths made relative to the repository
   root, and a job summary.
 
-[Unreleased]: https://github.com/vericto/check-sql/compare/v1.4.0...HEAD
+[Unreleased]: https://github.com/vericto/check-sql/compare/v1.4.1...HEAD
+[1.4.1]: https://github.com/vericto/check-sql/compare/v1.4.0...v1.4.1
 [1.4.0]: https://github.com/vericto/check-sql/compare/v1.3.0...v1.4.0
 [1.3.0]: https://github.com/vericto/check-sql/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/vericto/check-sql/compare/v1.1.0...v1.2.0

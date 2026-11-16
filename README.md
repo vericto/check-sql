@@ -405,7 +405,7 @@ changed, the check passes and no SQL is sent.
   single argument.
 - **Pinned dependencies.** Every action this action uses is pinned by commit
   SHA. You can pin this action the same way:
-  `uses: vericto/check-sql@<full commit SHA> # v1.4.0`.
+  `uses: vericto/check-sql@<full commit SHA> # v1.4.1`.
 
 Report vulnerabilities as described in [SECURITY.md](SECURITY.md).
 
@@ -466,7 +466,7 @@ action 1.4.0.
 
 Releases follow [Semantic Versioning](https://semver.org). The major tag
 (`v1`) moves to each compatible release, the usual convention for GitHub
-Actions; `@v1.4.0` or a commit SHA stays fixed. Each action release pins a
+Actions; `@v1.4.1` or a commit SHA stays fixed. Each action release pins a
 CLI version, and a CLI bump ships as a new action release.
 
 ## Tests
