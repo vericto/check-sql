@@ -6,7 +6,7 @@ author: Vericto
 
 branding:
   icon: shield
-  color: blue
+  color: gray-dark
 
 inputs:
   api-key:
